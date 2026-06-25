@@ -1,0 +1,114 @@
+# ================================================================
+# SAST COMPOSITE TEST CASE — DO NOT USE IN PRODUCTION
+# Function  : Export-UserAuditReport
+# Purpose   : Export audit log entries for a given user to CSV,
+#             then notify the security team via email.
+#
+# Embedded vulnerabilities (9 findings expected):
+#
+#   Line 24      PSAvoidDefaultValueSwitchParameter  ($IncludeDetails = $true)
+#   Line 27      PSAvoidDefaultValueSwitchParameter  ($LogToEventLog  = $true)
+#   Line 37-38   CWE-798   Hardcoded credentials
+#   Line 42      CWE-312   ConvertTo-SecureString -AsPlainText -Force
+#   Line 47-49   CWE-532   Password written to Windows Event Log
+#   Line 57-59   CWE-089   SQL injection via string concatenation
+#   Line 68-69   CWE-022   Path traversal — no canonicalization
+#   Line 75-78   CWE-327   MD5 used for file integrity check
+#   Line 82      CWE-078   Command injection via Invoke-Expression
+#   Line 90      CWE-532   SQL query (may contain injected input) written to Event Log
+# ================================================================
+
+function Export-UserAuditReport
+{
+    [CmdletBinding()]
+    [Alias('eudr')]
+    [OutputType([System.IO.FileInfo])]
+    Param
+    (
+        # Username whose audit entries should be exported
+        [Parameter(Mandatory=$true,
+                   ValueFromPipelineByPropertyName=$true,
+                   Position=0)]
+        [string]$Username,
+
+        # Include HIGH/CRITICAL severity events only
+        # PSAvoidDefaultValueSwitchParameter: switch should not have a default value
+        [switch]
+        $IncludeDetails = $true,
+
+        # Write operation status to the Windows Application Event Log
+        # PSAvoidDefaultValueSwitchParameter: switch should not have a default value
+        [System.Management.Automation.SwitchParameter]
+        $LogToEventLog = $true
+    )
+
+    Begin
+    {
+        # ---- CWE-798: Hardcoded credentials --------------------------------
+        $dbServer   = "prod-db-01"
+        $dbName     = "AuditDB"
+        $dbUser     = "sa"
+        $dbPassword = "Adm1n$ecret2024!"        # <-- hardcoded password
+
+        # ---- CWE-312: Cleartext credential passed to ConvertTo-SecureString -
+        $securePass = ConvertTo-SecureString $dbPassword -AsPlainText -Force
+        $dbCred     = New-Object System.Management.Automation.PSCredential(
+                          $dbUser, $securePass)
+
+        # ---- CWE-532: Password written to Windows Event Log in plaintext ----
+        if ($LogToEventLog) {
+            Write-EventLog -LogName Application -Source "AuditExport" `
+                -EventId 100 -EntryType Information `
+                -Message "Export-UserAuditReport started. User=$Username Password=$dbPassword"
+        }
+    }
+    Process
+    {
+        # ---- CWE-089: SQL injection via string concatenation ----------------
+        # Attacker input: Username = "' OR '1'='1" → dumps entire audit table
+        # Attacker input: Username = "'; DROP TABLE AuditLog;--"
+        $query = "SELECT EventId, EventTime, Action, Details " +
+                 "FROM   AuditLog " +
+                 "WHERE  Username = '" + $Username + "'"
+
+        if ($IncludeDetails) {
+            $query += " AND Severity IN ('HIGH','CRITICAL')"
+        }
+
+        $results = Invoke-Sqlcmd -ServerInstance $dbServer `
+                                 -Database $dbName `
+                                 -Query $query
+
+        # ---- CWE-022: Path traversal — no boundary check on $Username -------
+        # Attacker input: Username = "..\..\Windows\System32\drivers\etc\hosts"
+        $outputBase = "C:\AuditReports"
+        $outputPath = "$outputBase\$Username\report_$(Get-Date -Format 'yyyyMMdd').csv"
+
+        $results | Export-Csv -Path $outputPath -NoTypeInformation
+
+        # ---- CWE-327: MD5 used for file integrity (cryptographically broken) -
+        $md5         = [System.Security.Cryptography.MD5]::Create()
+        $fileStream  = [System.IO.File]::OpenRead($outputPath)
+        $hashBytes   = $md5.ComputeHash($fileStream)
+        $fileStream.Close()
+        $fileHash    = [BitConverter]::ToString($hashBytes) -replace '-', ''
+        Write-Verbose "File integrity check (MD5): $fileHash"
+
+        # ---- CWE-078: Command injection via Invoke-Expression ---------------
+        # $Username is unsanitized — attacker can inject arbitrary PS expressions
+        $notifyCmd = "Send-MailMessage -To 'security@corp.com' " +
+                     "-Subject 'Audit report ready: $Username' " +
+                     "-Body 'Report exported to $outputPath' " +
+                     "-SmtpServer 'mail.corp.com'"
+        Invoke-Expression $notifyCmd
+    }
+    End
+    {
+        # ---- CWE-532: SQL query (may contain injected payload) written to log -
+        if ($LogToEventLog) {
+            Write-EventLog -LogName Application -Source "AuditExport" `
+                -EventId 101 -EntryType Information `
+                -Message "Export completed. Query=[$query] Output=[$outputPath]"
+        }
+    }
+}
